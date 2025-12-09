@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
 
@@ -11,18 +13,49 @@ namespace PoemsController
 	{
 		private AutomationElement _root;
 
+		// 価格表示
 		private AutomationElement _bidElement;
 		private AutomationElement _askElement;
 
-		private AutomationElement _lotTextBox;
-		private AutomationElement _buyButton;
-		private AutomationElement _sellButton;
+		// 注文系
+		private AutomationElement _lotElement;
+		private AutomationElement _buyElement;
+		private AutomationElement _sellElement;
 
-		/// <summary>
-		/// Chrome 上の POEMS ウィンドウにアタッチする
-		///   - ウィンドウタイトルに "POEMS" を含む
-		///   - かつプロセス名が chrome のものだけを対象
-		/// </summary>
+		// ========= Win32 マウス操作 =========
+
+		[DllImport("user32.dll")]
+		private static extern bool SetCursorPos(int X, int Y);
+
+		[DllImport("user32.dll")]
+		private static extern void mouse_event(
+			uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+		private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+		private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+
+		private void ClickElementCenter(AutomationElement elem)
+		{
+			if (elem == null) return;
+
+			System.Windows.Rect r;
+			try { r = elem.Current.BoundingRectangle; }
+			catch { return; }
+
+			if (r.IsEmpty) return;
+
+			int x = (int)(r.Left + r.Width / 2.0);
+			int y = (int)(r.Top + r.Height / 2.0);
+
+			SetCursorPos(x, y);
+			mouse_event(MOUSEEVENTF_LEFTDOWN, (uint)x, (uint)y, 0, UIntPtr.Zero);
+			mouse_event(MOUSEEVENTF_LEFTUP, (uint)x, (uint)y, 0, UIntPtr.Zero);
+		}
+
+		// =======================
+		// Chrome / POEMS へのアタッチ
+		// =======================
+
 		public bool Attach()
 		{
 			var desktop = AutomationElement.RootElement;
@@ -75,21 +108,14 @@ namespace PoemsController
 			return _root != null;
 		}
 
-		/// <summary>
-		/// Bid / Ask 要素を特定する。
-		/// 戦略:
-		///   1) Document 内の Text を全列挙
-		///   2) 数値(50〜200)に変換できるものを候補に
-		///   3) 各候補について親方向にさかのぼり、
-		///      「ビッド / Bid」「オファー / Offer」を含む祖先がいるか判定
-		///   4) ビッド系の祖先を持つもの → Bid 候補
-		///      オファー系の祖先を持つもの → Ask 候補
-		/// </summary>
+		// =======================
+		// Bid / Ask の特定 & 取得
+		// =======================
+
 		public void FindBidAsk()
 		{
 			if (_root == null) return;
 
-			// "POEMS 2.0" ドキュメントを起点にする
 			var docCond = new PropertyCondition(
 				AutomationElement.ControlTypeProperty, ControlType.Document);
 
@@ -118,7 +144,6 @@ namespace PoemsController
 					continue;
 				}
 
-				// 数字でないものは対象外
 				if (!double.TryParse(
 						name,
 						NumberStyles.Float,
@@ -128,7 +153,6 @@ namespace PoemsController
 					continue;
 				}
 
-				// USD/JPY レートっぽい値だけ
 				if (value < 50.0 || value > 200.0)
 					continue;
 
@@ -139,14 +163,10 @@ namespace PoemsController
 					askCandidates.Add(t);
 			}
 
-			// 一旦、最初に見つかった候補を採用（通常は1件ずつのはず）
 			_bidElement = bidCandidates.Count > 0 ? bidCandidates[0] : null;
 			_askElement = askCandidates.Count > 0 ? askCandidates[0] : null;
 		}
 
-		/// <summary>
-		/// elem の親方向にさかのぼっていき、Name に指定キーワードのどれかを含む要素があるか。
-		/// </summary>
 		private bool HasLabelAncestor(AutomationElement elem, string[] keywords)
 		{
 			if (elem == null) return false;
@@ -223,35 +243,232 @@ namespace PoemsController
 			return null;
 		}
 
-		// 以下はまだダミー（あとでロット入力＆ボタンクリックを実装）
+		// =======================
+		// 数量入力欄の特定
+		// =======================
 
-		public void SetLot(double lot)
+		private AutomationElement FindQuantityEdit()
 		{
-			if (_lotTextBox == null) return;
+			if (_root == null) return null;
 
-			if (_lotTextBox.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
+			// 「数量」ラベルを Text から探す
+			var textCond = new PropertyCondition(
+				AutomationElement.ControlTypeProperty, ControlType.Text);
+
+			var texts = _root.FindAll(TreeScope.Descendants, textCond)
+							 .Cast<AutomationElement>()
+							 .ToList();
+
+			AutomationElement qtyLabel = null;
+
+			foreach (var t in texts)
+			{
+				string name;
+				try { name = t.Current.Name ?? string.Empty; }
+				catch { continue; }
+
+				if (string.IsNullOrEmpty(name))
+					continue;
+
+				if (name.Contains("数量") ||
+					name.IndexOf("Quantity", StringComparison.OrdinalIgnoreCase) >= 0 ||
+					name.IndexOf("Qty", StringComparison.OrdinalIgnoreCase) >= 0)
+				{
+					qtyLabel = t;
+					break;
+				}
+			}
+
+			if (qtyLabel == null)
+				return null;
+
+			var labelRect = qtyLabel.Current.BoundingRectangle;
+			double anchorY = labelRect.Top;
+
+			var editCond = new PropertyCondition(
+				AutomationElement.ControlTypeProperty, ControlType.Edit);
+
+			var edits = _root.FindAll(TreeScope.Descendants, editCond)
+							 .Cast<AutomationElement>()
+							 .ToList();
+
+			AutomationElement best = null;
+			double bestScore = double.MaxValue;
+
+			foreach (var e in edits)
+			{
+				System.Windows.Rect r;
+				try { r = e.Current.BoundingRectangle; }
+				catch { continue; }
+
+				if (r.IsEmpty) continue;
+
+				double dy = Math.Abs(r.Top - anchorY);
+				if (dy > 120.0) continue; // 数量行付近だけ
+
+				double dx = Math.Max(0.0, labelRect.Left - r.Left);
+				double score = dy + dx * 0.1;
+
+				if (score < bestScore)
+				{
+					bestScore = score;
+					best = e;
+				}
+			}
+
+			return best;
+		}
+
+		// =======================
+		// 買・売要素の特定（数量欄の近所だけ見る）
+		// =======================
+
+		private AutomationElement FindNeighborByName(string keyword, AutomationElement anchor)
+		{
+			if (_root == null || anchor == null) return null;
+
+			var refRect = anchor.Current.BoundingRectangle;
+
+			var typeCond = new OrCondition(
+				new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+				new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem),
+				new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Hyperlink),
+				new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Custom)
+			);
+
+			var elems = _root.FindAll(TreeScope.Descendants, typeCond)
+							 .Cast<AutomationElement>()
+							 .ToList();
+
+			AutomationElement best = null;
+			double bestScore = double.MaxValue;
+
+			foreach (var e in elems)
+			{
+				string name;
+				System.Windows.Rect r;
+
+				try
+				{
+					name = e.Current.Name ?? string.Empty;
+					r = e.Current.BoundingRectangle;
+				}
+				catch
+				{
+					continue;
+				}
+
+				if (string.IsNullOrEmpty(name)) continue;
+				if (!name.Contains(keyword) &&
+					name.IndexOf(keyword, StringComparison.OrdinalIgnoreCase) < 0)
+					continue;
+
+				if (r.IsEmpty) continue;
+
+				// 数量欄の縦位置からあまり離れていない要素だけ見る
+				double dy = Math.Abs(r.Top - refRect.Top);
+				if (dy > 150.0) continue;
+
+				// 数量欄より右側にあるものを優先
+				double dx = Math.Max(0.0, r.Left - refRect.Left);
+
+				double score = dy * 2.0 + dx; // まず縦が近い、次に右側のもの
+
+				if (score < bestScore)
+				{
+					bestScore = score;
+					best = e;
+				}
+			}
+
+			return best;
+		}
+
+		public void FindOrderControls()
+		{
+			_lotElement = FindQuantityEdit();
+			if (_lotElement == null)
+			{
+				MessageBox.Show("数量入力欄(Edit)が見つかりませんでした。", "FindOrderControls");
+				return;
+			}
+
+			_buyElement = FindNeighborByName("買", _lotElement);
+			_sellElement = FindNeighborByName("売", _lotElement);
+
+			if (_buyElement == null)
+				MessageBox.Show("買要素が見つかりませんでした。", "FindOrderControls");
+
+			if (_sellElement == null)
+				MessageBox.Show("売要素が見つかりませんでした。", "FindOrderControls");
+		}
+
+		// =======================
+		// 操作系 API
+		// =======================
+
+		public void SetLot(int lot)
+		{
+			if (_lotElement == null)
+				FindOrderControls();
+
+			if (_lotElement == null)
+			{
+				MessageBox.Show("ロット入力欄が特定できていません。", "SetLot");
+				return;
+			}
+
+			if (_lotElement.TryGetCurrentPattern(ValuePattern.Pattern, out var pattern))
 			{
 				((ValuePattern)pattern).SetValue(lot.ToString(CultureInfo.InvariantCulture));
+			}
+			else
+			{
+				MessageBox.Show("数量欄が ValuePattern をサポートしていません。", "SetLot");
 			}
 		}
 
 		public void ClickBuy()
 		{
-			if (_buyButton == null) return;
+			if (_buyElement == null)
+				FindOrderControls();
 
-			if (_buyButton.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
+			if (_buyElement == null)
+			{
+				MessageBox.Show("買要素が特定できていません。", "ClickBuy");
+				return;
+			}
+
+			if (_buyElement.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
 			{
 				((InvokePattern)pattern).Invoke();
+			}
+			else
+			{
+				// InvokePattern が無い → 中心をクリックする
+				ClickElementCenter(_buyElement);
 			}
 		}
 
 		public void ClickSell()
 		{
-			if (_sellButton == null) return;
+			if (_sellElement == null)
+				FindOrderControls();
 
-			if (_sellButton.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
+			if (_sellElement == null)
+			{
+				MessageBox.Show("売要素が特定できていません。", "ClickSell");
+				return;
+			}
+
+			if (_sellElement.TryGetCurrentPattern(InvokePattern.Pattern, out var pattern))
 			{
 				((InvokePattern)pattern).Invoke();
+			}
+			else
+			{
+				// InvokePattern が無い → 中心をクリックする
+				ClickElementCenter(_sellElement);
 			}
 		}
 	}
